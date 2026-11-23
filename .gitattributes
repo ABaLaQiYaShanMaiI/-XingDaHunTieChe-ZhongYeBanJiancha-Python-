@@ -1,0 +1,5 @@
+# 统一文本文件换行符为 LF，避免 autocrlf 导致的换行符冲突
+*.py   text eol=lf
+*.spec text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
