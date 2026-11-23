@@ -1,14 +1,16 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-混铁车中夜班安全消防检查情况报告自动生成工具 - 核心逻辑 v1.0.0
+混铁车中夜班安全消防检查情况报告自动生成工具 - 核心逻辑 v1.0.1
 """
 
 import logging
 import os
+import random
 import re
 import sys
 import zipfile
+from copy import deepcopy
 from datetime import date, datetime
 from io import BytesIO
 from xml.etree import ElementTree as ET
@@ -18,7 +20,7 @@ import xlrd
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import parse_xml
-from docx.oxml.ns import nsdecls
+from docx.oxml.ns import nsdecls, qn
 from docx.shared import Inches, Pt
 from openpyxl.utils.datetime import from_excel
 
@@ -224,14 +226,7 @@ def resolve_duty(roster_data, month, day, area_key=None):
 
     area_key 指定时 inspector 取该作业区人员；未指定或未命中时取第一个非空人员。
     """
-    duty = roster_data.get(_normalize_md(month, day), {})
-    if not duty:
-        zm = str(month).zfill(2)
-        zd = str(day).zfill(2)
-        duty = roster_data.get(f"{zm}.{zd}", {})
-    if not duty:
-        full_key = f"{datetime.now().year}.{str(month).zfill(2)}.{str(day).zfill(2)}"
-        duty = roster_data.get(full_key, {})
+    duty = _find_duty(roster_data, month, day)
     leader = duty.get('leader', '')
     inspector = duty.get(area_key, '') if area_key else ''
     if not inspector:
@@ -240,6 +235,44 @@ def resolve_duty(roster_data, month, day, area_key=None):
                 inspector = duty[k]
                 break
     return leader, inspector
+
+
+def _find_duty(roster_data, month, day):
+    """按日期查找值班信息，兼容短日期、补零日期和完整日期键。"""
+    duty = roster_data.get(_normalize_md(month, day), {})
+    if not duty:
+        zm = str(month).zfill(2)
+        zd = str(day).zfill(2)
+        duty = roster_data.get(f"{zm}.{zd}", {})
+    if not duty:
+        full_key = f"{datetime.now().year}.{str(month).zfill(2)}.{str(day).zfill(2)}"
+        duty = roster_data.get(full_key, {})
+    return duty or {}
+
+
+def _format_check_time(roster_data, month, day):
+    """生成“检查时间”文本：周末 9:00-10:00，工作日 15:00-17:00，时间随机。"""
+    duty = _find_duty(roster_data, month, day)
+    day_of_week = _cell_text(duty.get('day_of_week', ''))
+    if '六' in day_of_week or '日' in day_of_week:
+        is_weekend = True
+    elif day_of_week:
+        is_weekend = False
+    else:
+        full_date = duty.get('full_date')
+        if isinstance(full_date, datetime):
+            is_weekend = full_date.weekday() >= 5
+        else:
+            try:
+                is_weekend = datetime(datetime.now().year, int(month), int(day)).weekday() >= 5
+            except (TypeError, ValueError):
+                is_weekend = datetime.now().weekday() >= 5
+
+    start_minute = 9 * 60 if is_weekend else 15 * 60
+    span = 60 if is_weekend else 120
+    total = start_minute + random.randint(0, span - 1)
+    hour, minute = divmod(total, 60)
+    return f'{int(month)}.{int(day)} {hour}:{minute:02d}'
 
 
 
@@ -608,6 +641,28 @@ def _leader_role(leader_name):
     return DEFAULT_ROLE
 
 
+def _write_title(doc, text):
+    """写入报告标题，兼容模板标题段落没有 run 的情况，并保留模板字号格式。"""
+    p = doc.paragraphs[0]
+    for run in list(p.runs):
+        run._element.getparent().remove(run._element)
+    run = p.add_run(text)
+    rPr = run._r.get_or_add_rPr()
+    pPr = p._p.pPr
+    src_rPr = pPr.find(qn('w:rPr')) if pPr is not None else None
+    if src_rPr is not None:
+        for child in src_rPr:
+            rPr.append(deepcopy(child))
+    fonts = rPr.find(qn('w:rFonts'))
+    if fonts is None:
+        fonts = parse_xml(f'<w:rFonts {nsdecls("w")} w:hint="eastAsia"/>')
+        rPr.insert(0, fonts)
+    else:
+        fonts.set(qn('w:hint'), 'eastAsia')
+    if rPr.find(qn('w:u')) is None:
+        rPr.append(parse_xml(f'<w:u {nsdecls("w")} w:val="single"/>'))
+
+
 def generate_docx(roster_data, sweep_item, output_path, month, day_str, template_path=None):
     month = str(month).strip()
     day_str = str(day_str).strip()
@@ -615,25 +670,26 @@ def generate_docx(roster_data, sweep_item, output_path, month, day_str, template
     if template_path is None:
         template_path = _find_template()
     doc = Document(template_path)
+    if not doc.tables:
+        raise ValueError('模板.docx 中没有表格，请检查模板')
     table = doc.tables[0]
+    if len(table.rows) < 13 or len(table.columns) < 17:
+        raise ValueError('模板.docx 表格结构已变化（需至少 13 行、17 列），请检查模板填充坐标')
     title_text = (f'    {BI_NAME}   {month}月{day_num}日中夜班'
                   f'（双休日、节假日）安全消防检查情况')
-    if doc.paragraphs and doc.paragraphs[0].runs:
-        for run in doc.paragraphs[0].runs:
-            run.text = ''
-        doc.paragraphs[0].runs[0].text = title_text
+    _write_title(doc, title_text)
     area_key = get_sweep_area_key(sweep_item)
     leader_name, inspector_name = resolve_duty(roster_data, month, day_num, area_key)
     _fill_cell_text(table.cell(*DOC_CELL_LEADER), leader_name)
     _fill_cell_text(table.cell(*DOC_CELL_LEADER_ROLE), _leader_role(leader_name))
     _fill_cell_text(table.cell(*DOC_CELL_INSPECTOR), inspector_name)
     _fill_cell_text(table.cell(*DOC_CELL_INSPECTOR_ROLE), DEFAULT_ROLE)
-    _fill_cell_text(table.cell(*DOC_CELL_DATE), f'{month}.{day_num}')
+    _fill_cell_text(table.cell(*DOC_CELL_DATE), _format_check_time(roster_data, month, day_num))
     nat = '违章' if sweep_item.get('nature', '') and '违章' in sweep_item['nature'] else '隐患'
     _fill_cell_text(table.cell(*DOC_CELL_NATURE), nat)
     _fill_cell_text(table.cell(*DOC_CELL_DESC), sweep_item.get('description', ''))
     _fill_cell_text(table.cell(*DOC_CELL_NATURE2), nat)
-    _fill_cell_text(table.cell(*DOC_CELL_RESPONSIBLE), '责任人：' + sweep_item.get('responsible', ''))
+    _fill_cell_text(table.cell(*DOC_CELL_RESPONSIBLE), '责任人：' + leader_name)
     img_cell = table.cell(*DOC_CELL_IMAGE)
     for p in list(img_cell.paragraphs):
         p._element.getparent().remove(p._element)
@@ -676,11 +732,37 @@ def _split_images(sweep_item):
     return before, after
 
 
+def _apply_paragraph_run_format(paragraph, run):
+    """把段落标记上的字体格式复制到新建 run，避免模板单元格无 run 时丢失字体。"""
+    rPr = run._r.get_or_add_rPr()
+    pPr = paragraph._p.pPr
+    src_rPr = pPr.find(qn('w:rPr')) if pPr is not None else None
+    if src_rPr is not None:
+        for child in src_rPr:
+            rPr.append(deepcopy(child))
+
+    fonts = rPr.find(qn('w:rFonts'))
+    if fonts is None:
+        fonts = parse_xml(
+            f'<w:rFonts {nsdecls("w")} w:ascii="仿宋" w:hAnsi="仿宋" '
+            f'w:eastAsia="仿宋" w:cs="仿宋" w:hint="eastAsia"/>')
+        rPr.insert(0, fonts)
+    else:
+        if not any(fonts.get(qn(f'w:{key}')) for key in ('ascii', 'hAnsi', 'eastAsia', 'cs')):
+            for key in ('ascii', 'hAnsi', 'eastAsia', 'cs'):
+                fonts.set(qn(f'w:{key}'), '仿宋')
+        fonts.set(qn('w:hint'), 'eastAsia')
+    if rPr.find(qn('w:sz')) is None:
+        rPr.append(parse_xml(f'<w:sz {nsdecls("w")} w:val="30"/>'))
+    if rPr.find(qn('w:szCs')) is None:
+        rPr.append(parse_xml(f'<w:szCs {nsdecls("w")} w:val="30"/>'))
+
+
 def _fill_cell_text(cell, text):
     """写入文本，保留模板单元格原有 run 的字体/字号格式（仿宋·小三）。
 
-    做法：保留第一个 run（含其 rPr 格式），删除其余多余的空 run，再改文字，
-    避免新建 run 时丢失模板的字体、字号等格式。
+    做法：优先保留第一个 run（含其 rPr 格式），删除其余多余的空 run，再改文字；
+    模板单元格没有 run 时，新建 run 并复制段落上的 rPr，避免回落到默认字体。
     """
     p = cell.paragraphs[0]
     runs = p.runs
@@ -690,5 +772,6 @@ def _fill_cell_text(cell, text):
             run._element.getparent().remove(run._element)
         first.text = str(text)
     else:
-        p.add_run(str(text))
+        run = p.add_run(str(text))
+        _apply_paragraph_run_format(p, run)
 

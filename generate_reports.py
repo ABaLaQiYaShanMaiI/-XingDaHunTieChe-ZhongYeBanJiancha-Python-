@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-混铁车中夜班安全消防检查情况报告自动生成工具 GUI v1.0.0
+混铁车中夜班安全消防检查情况报告自动生成工具 GUI v1.0.1
 """
 
 import os
@@ -19,7 +19,7 @@ from tkinter import filedialog, messagebox, ttk, scrolledtext
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
 
-APP_TITLE = '混铁车中夜班安全消防检查情况报告自动生成工具 v1.0.0'
+APP_TITLE = '混铁车中夜班安全消防检查情况报告自动生成工具 v1.0.1'
 
 
 class ReportGeneratorApp:
@@ -139,6 +139,8 @@ class ReportGeneratorApp:
         self.prog = ttk.Progressbar(gf, mode='determinate', length=300)
         self.prog.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(10,0))
         ttk.Button(gf, text="生成报告文件", command=self._gen).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(gf, text="生成选中报告文件",
+                   command=self._gen_selected).pack(side=tk.RIGHT, padx=5)
 
         # ---- 日志 ----
         logf = ttk.LabelFrame(mf, text="日志", padding=5)
@@ -147,6 +149,7 @@ class ReportGeneratorApp:
         self.log_text.pack(fill=tk.BOTH, expand=True)
         self._log("欢迎使用！请拖入值班表(.xls/.xlsx)和隐患登记表(.xlsx)。")
         self._log("提示：列表中按 Ctrl+A 可全选项目，再统一设置/清空日期。")
+        self._log("提示：选中项目后点击“生成选中报告文件”，可只生成选中项。")
 
 
     # ==================== 日志与提示 ====================
@@ -498,42 +501,61 @@ class ReportGeneratorApp:
 
     # ==================== 生成报告 ====================
     def _gen(self):
+        self._generate(only_selected=False)
+
+    def _gen_selected(self):
+        if not self._selected_indices():
+            messagebox.showinfo("提示", "请先在列表中选中项目（Ctrl+A 可全选），再点击“生成选中报告文件”。")
+            return
+        self._generate(only_selected=True)
+
+    def _generate(self, only_selected=False):
         if not self.roster_data:
             messagebox.showwarning("警告", "请先加载值班表！")
             return
         if not self.sweep_items:
             messagebox.showwarning("警告", "请先加载隐患登记表！")
             return
-        undated = [i for i, v in self.item_dates.items() if not v]
-        if undated:
-            if not messagebox.askyesno("确认", f"有 {len(undated)} 个项目未分配日期，将被跳过。\n是否继续？"):
-                return
         month = self.month_var.get().strip()
         out = self.out_dir.get()
-        os.makedirs(out, exist_ok=True)
-        items = [(i, item, d) for i, item in enumerate(self.sweep_items)
+        if only_selected:
+            pairs = [(i, self.sweep_items[i]) for i in self._selected_indices()]
+        else:
+            pairs = list(enumerate(self.sweep_items))
+            undated = [i for i, v in self.item_dates.items() if not v]
+            if undated:
+                if not messagebox.askyesno("确认", f"有 {len(undated)} 个项目未分配日期，将被跳过。\n是否继续？"):
+                    return
+        items = [(i, item, d) for i, item in pairs
                  if (d := self.item_dates.get(i, '').strip())]
+        skipped = len(pairs) - len(items)
         if not items:
-            messagebox.showwarning("警告", "没有可生成的项目！")
+            messagebox.showwarning("警告", "选中的项目都未分配日期！" if only_selected
+                                   else "没有可生成的项目！")
             return
-        preview_lines = []
-        for idx, item, day in items[:5]:
-            ds = f"{month}.{day}"
-            leader, inspector = resolve_duty(self.roster_data, month, day,
-                                             get_sweep_area_key(item))
-            area = get_sweep_area_label(item)
-            preview_lines.append(f"  {ds}日 [{area}] 值班领导:{leader or '?'}  检查人:{inspector or '?'}")
-        preview_text = "\n".join(preview_lines)
-        if len(items) > 5:
-            preview_text += f"\n  ... 共 {len(items)} 项"
-        if not messagebox.askyesno("生成预览确认",
-            f"即将生成 {len(items)} 个文件：\n\n{preview_text}\n\n输出目录：{out}\n\n确认生成？"):
-            return
+        if only_selected and skipped:
+            self._log(f"选中项中有 {skipped} 项未分配日期，已跳过")
+        if not only_selected:
+            preview_lines = []
+            for idx, item, day in items[:5]:
+                ds = f"{month}.{day}"
+                leader, inspector = resolve_duty(self.roster_data, month, day,
+                                                 get_sweep_area_key(item))
+                area = get_sweep_area_label(item)
+                preview_lines.append(f"  {ds}日 [{area}] 值班领导:{leader or '?'}  检查人:{inspector or '?'}")
+            preview_text = "\n".join(preview_lines)
+            if len(items) > 5:
+                preview_text += f"\n  ... 共 {len(items)} 项"
+            if not messagebox.askyesno("生成预览确认",
+                f"即将生成 {len(items)} 个文件：\n\n{preview_text}\n\n输出目录：{out}\n\n确认生成？"):
+                return
+        os.makedirs(out, exist_ok=True)
         total = len(items)
         self.prog['maximum'] = total
         self.prog['value'] = 0
         ok = err = 0
-        self._log(f"开始生成 {total} 个文件 -> {out}")
+        scope = "选中的" if only_selected else "全部"
+        self._log(f"开始生成{scope} {total} 个文件 -> {out}")
         for idx, item, day in items:
             try:
                 ds = f"{month}.{day}"

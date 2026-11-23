@@ -5,3 +5,4 @@ build/
 *.pyo
 *.xls
 *.xlsx
+~$*
